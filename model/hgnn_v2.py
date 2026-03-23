@@ -218,8 +218,42 @@ class HypergraphTransformer(nn.Module):
         self.norm = nn.LayerNorm(feature_dim, eps=1e-6)
         self.q_proj = nn.Linear(feature_dim, attn_dim, bias=False)
         self.k_proj = nn.Linear(feature_dim, attn_dim, bias=False)
-        self.alpha_logit = nn.Parameter(torch.tensor(-0.4))  # alpha ~= 0.4
-        self.gate_scale = nn.Parameter(torch.tensor(2.0))
+        self.alpha_logit = nn.Parameter(torch.tensor(-0.8473))  # alpha ~= 0.3
+        self._monitor_state = {}
+
+    @staticmethod
+    def _tensor_stats(tensor, prefix):
+        tensor = tensor.detach().float()
+        return {
+            '{}_mean'.format(prefix): tensor.mean().item(),
+            '{}_std'.format(prefix): tensor.std(unbiased=False).item(),
+            '{}_abs_mean'.format(prefix): tensor.abs().mean().item(),
+            '{}_rms'.format(prefix): tensor.pow(2).mean().sqrt().item(),
+            '{}_min'.format(prefix): tensor.min().item(),
+            '{}_max'.format(prefix): tensor.max().item(),
+        }
+
+    def _grad_stat_hook(self, name):
+        def hook(grad):
+            self._monitor_state.update(self._tensor_stats(grad, '{}_grad'.format(name)))
+        return hook
+
+    def get_monitor_stats(self):
+        stats = dict(self._monitor_state)
+        stats['alpha_logit'] = self.alpha_logit.detach().item()
+        stats['alpha'] = torch.sigmoid(self.alpha_logit.detach()).item()
+        stats['alpha_logit_grad'] = 0.0 if self.alpha_logit.grad is None else self.alpha_logit.grad.detach().item()
+        stats['q_proj_weight_rms'] = self.q_proj.weight.detach().float().pow(2).mean().sqrt().item()
+        stats['k_proj_weight_rms'] = self.k_proj.weight.detach().float().pow(2).mean().sqrt().item()
+        if self.q_proj.weight.grad is None:
+            stats['q_proj_weight_grad_rms'] = 0.0
+        else:
+            stats['q_proj_weight_grad_rms'] = self.q_proj.weight.grad.detach().float().pow(2).mean().sqrt().item()
+        if self.k_proj.weight.grad is None:
+            stats['k_proj_weight_grad_rms'] = 0.0
+        else:
+            stats['k_proj_weight_grad_rms'] = self.k_proj.weight.grad.detach().float().pow(2).mean().sqrt().item()
+        return stats
 
     def forward(self, V, H_g):
         """
@@ -235,9 +269,28 @@ class HypergraphTransformer(nn.Module):
 
         H_g_batch = H_g.unsqueeze(0).expand(V.size(0), -1, -1)
         H_local = torch.matmul(A, H_g_batch)
-        gate = torch.sigmoid(self.gate_scale * H_local)
         alpha = torch.sigmoid(self.alpha_logit)
-        H_ref = H_g_batch * (1 + alpha * (gate - 0.5))
+        H_ref = (1 - alpha) * H_g_batch + alpha * H_local
+        H_delta = H_ref - H_g_batch
+        H_g_rms = H_g_batch.detach().float().pow(2).mean().sqrt()
+        attn_prob = A.detach().clamp_min(1e-8)
+
+        self._monitor_state = {}
+        self._monitor_state.update(self._tensor_stats(attn_scores, 'attn_scores'))
+        self._monitor_state.update(self._tensor_stats(Q, 'Q'))
+        self._monitor_state.update(self._tensor_stats(K, 'K'))
+        self._monitor_state.update(self._tensor_stats(H_g_batch, 'H_g_batch'))
+        self._monitor_state.update(self._tensor_stats(H_ref, 'H_ref'))
+        self._monitor_state.update(self._tensor_stats(H_delta, 'H_ref_delta'))
+        self._monitor_state['alpha'] = alpha.detach().item()
+        self._monitor_state['alpha_logit'] = self.alpha_logit.detach().item()
+        self._monitor_state['attn_entropy'] = -(attn_prob * attn_prob.log()).sum(dim=-1).mean().item()
+        self._monitor_state['H_ref_delta_rel_rms'] = H_delta.detach().float().pow(2).mean().sqrt().div(H_g_rms + 1e-6).item()
+
+        if torch.is_grad_enabled():
+            Q.register_hook(self._grad_stat_hook('Q'))
+            K.register_hook(self._grad_stat_hook('K'))
+
         G_ref = generate_G_from_H_batched(H_ref)
         return H_ref, G_ref
 
@@ -264,7 +317,7 @@ class HGNN_Model(nn.Module):
         # self.stage_2_hgnn = HGNN(512,512,512)
         self.stage_3_hgnn = HGNN(1024, 1024, 1024)
         self.stage_4_hgnn = HGNN(2048, 2048, 2048)
-        self.stage_4_refiner = HypergraphTransformer(feature_dim=self.input_dim, attn_dim=self.input_dim)
+        self.stage_4_refiner = HypergraphTransformer(feature_dim=self.input_dim, attn_dim=512)
         # self.learningMatrix = LearningMatrix()
         # H = np.load('/raid/ocr/lw/SSGRL-HGNN/data/coco/graph/conditional_prob_hyperG_top20_divide_80.npy')
         # self.label_embedding = torch.Tensor(cPickle.load(open('/raid/ocr/lw/ML-GCN/data/coco/coco_glove_word2vec.pkl', 'rb')))
@@ -274,7 +327,7 @@ class HGNN_Model(nn.Module):
     def load_features(self):
         # 根据num_classes判断数据集并加载对应的词向量文件
         if self.num_classes == 80:  # COCO2014有80个类别
-            word_file_path = '/home/sx639/GZS/coco2014/vectors.npy'
+            word_file_path = '/media/ubuntu2/A/coco2014/vectors.npy'
         elif self.num_classes == 200:  # VG有200个类别
             word_file_path = '/home/sx639/GZS/vg/vg_200_vector.npy'
         elif self.num_classes == 20:  # VOC2007有20个类别
@@ -304,6 +357,19 @@ class HGNN_Model(nn.Module):
         batch_aog_nodes = torch.cat((stage_3_batch_aog_nodes, stage_4_batch_aog_nodes), 2)
 
         return batch_aog_nodes
+
+    def get_refiner_monitor_stats(self):
+        stats = self.stage_4_refiner.get_monitor_stats()
+        H_g = torch.sigmoid(self.H.detach()).float()
+        stats['global_H_mean'] = H_g.mean().item()
+        stats['global_H_std'] = H_g.std(unbiased=False).item()
+        stats['global_H_rms'] = H_g.pow(2).mean().sqrt().item()
+        if self.H.grad is None:
+            stats['global_H_grad_rms'] = 0.0
+        else:
+            H_grad = self.H.grad.detach().float()
+            stats['global_H_grad_rms'] = H_grad.pow(2).mean().sqrt().item()
+        return stats
 
 
 class AdaHGNN(nn.Module):
@@ -345,6 +411,9 @@ class AdaHGNN(nn.Module):
         output = output.contiguous().view(batch_size, self.num_classes, self.output_dim)
         result = self.classifiers(output)
         return result
+
+    def get_refiner_monitor_stats(self):
+        return self.hgnn_model.get_refiner_monitor_stats()
 
     def load_features(self):
         return Parameter(torch.from_numpy(self.word_features.astype(np.float32)))
