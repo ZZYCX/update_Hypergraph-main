@@ -129,6 +129,24 @@ def main():
         writer.add_scalar('top1_acc', top1_acc, epoch)
         writer.add_scalar('top3_acc', top3_acc, epoch)
         writer.add_scalar('top5_acc', top5_acc, epoch)
+        for key, value in refinement_monitor_stats.items():
+            writer.add_scalar(f'refine/{key}', value, epoch)
+
+        if refinement_monitor_stats:
+            logger.info(
+                '[Refine] [Epoch {0}]: beta {1:.4f} delta_h_mean_abs {2:.4f} '
+                'clamp_upper_ratio {3:.4f} clamp_lower_ratio {4:.4f} clamp_ratio {5:.4f} '
+                'h_ref_shift_ratio {6:.4f} sample_var {7:.4f}'.format(
+                    epoch,
+                    refinement_monitor_stats.get('beta', 0.0),
+                    refinement_monitor_stats.get('delta_h_mean_abs', 0.0),
+                    refinement_monitor_stats.get('clamp_upper_ratio', 0.0),
+                    refinement_monitor_stats.get('clamp_lower_ratio', 0.0),
+                    refinement_monitor_stats.get('clamp_ratio', 0.0),
+                    refinement_monitor_stats.get('h_ref_shift_ratio', 0.0),
+                    refinement_monitor_stats.get('sample_var', 0.0),
+                )
+            )
         torch.cuda.empty_cache()
 
         isBest, bestPrec = mAP > bestPrec, max(mAP, bestPrec)
@@ -161,6 +179,9 @@ def Train(train_loader, model, criterion, optimizer, scaler, scheduler, writer, 
         # with amp.autocast(enabled=enable_amp):
         # Forward
         output = model(input)
+        monitor_stats = model.get_refinement_monitor_stats()
+        for key, value in monitor_stats.items():
+            epoch_monitor[key].update(value, input.size(0))
         # Compute and log loss
         loss_ = criterion['BCELoss'](output, target)
         # assert torch.isnan(loss_).sum() == 0, print(loss_)
@@ -251,6 +272,7 @@ def Validate(val_loader, model, criterion, epoch, args,scheduler):
         mAP=mAP, averageAP=averageAP, top1_acc=averageTop1, top3_acc=averageTop3, top5_acc=averageTop5,
         OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1, OP_K=OP_K, OR_K=OR_K, OF1_K=OF1_K, CP_K=CP_K, CR_K=CR_K,
         CF1_K=CF1_K))
+
 
     return mAP, averageTop1, averageTop3, averageTop5
 

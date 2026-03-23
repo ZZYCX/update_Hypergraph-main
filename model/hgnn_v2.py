@@ -211,15 +211,18 @@ class HGNN_classifier(nn.Module):
 
 
 class HypergraphTransformer(nn.Module):
-    def __init__(self, feature_dim, attn_dim):
+    def __init__(self, feature_dim, edge_dim, attn_dim=None, eps=1e-6):
         super(HypergraphTransformer, self).__init__()
         self.feature_dim = feature_dim
-        self.attn_dim = attn_dim
-        self.norm = nn.LayerNorm(feature_dim, eps=1e-6)
-        self.q_proj = nn.Linear(feature_dim, attn_dim, bias=False)
-        self.k_proj = nn.Linear(feature_dim, attn_dim, bias=False)
-        self.alpha_logit = nn.Parameter(torch.tensor(-0.4))  # alpha ~= 0.4
-        self.gate_scale = nn.Parameter(torch.tensor(2.0))
+        self.edge_dim = edge_dim
+        self.attn_dim = attn_dim if attn_dim is not None else feature_dim
+        self.monitor_eps = eps
+        self.norm = nn.LayerNorm(feature_dim, eps=eps)
+        self.q_proj = nn.Linear(feature_dim, self.attn_dim, bias=False)
+        self.k_proj = nn.Linear(feature_dim, self.attn_dim, bias=False)
+        self.edge_proj = nn.Linear(feature_dim, edge_dim, bias=True)
+        self.beta_logit = nn.Parameter(torch.tensor(-1.4))
+        self._last_monitor_stats = {}
 
     def forward(self, V, H_g):
         """
@@ -227,19 +230,60 @@ class HypergraphTransformer(nn.Module):
         :param H_g: global hypergraph prior with shape [N, E]
         :return: refined incidence H_ref [B, N, E], refined propagation G_ref [B, N, N]
         """
+        if V.dim() != 3:
+            raise ValueError("Expected V to have shape [B, N, D].")
+        if H_g.dim() != 2:
+            raise ValueError("Expected H_g to have shape [N, E].")
+        if V.size(-1) != self.feature_dim:
+            raise ValueError(
+                f"Expected V feature dim {self.feature_dim}, got {V.size(-1)}."
+            )
+        if V.size(1) != H_g.size(0):
+            raise ValueError(
+                f"Node count mismatch between V ({V.size(1)}) and H_g ({H_g.size(0)})."
+            )
+        if H_g.size(1) != self.edge_dim:
+            raise ValueError(
+                f"Expected H_g edge dim {self.edge_dim}, got {H_g.size(1)}."
+            )
+
         V_attn = self.norm(V)
         Q = self.q_proj(V_attn)
         K = self.k_proj(V_attn)
         attn_scores = torch.matmul(Q, K.transpose(1, 2)) / math.sqrt(self.attn_dim)
-        A = F.softmax(attn_scores, dim=-1)
+        attn = F.softmax(attn_scores, dim=-1)
 
+        context = torch.matmul(attn, V_attn)
+        delta_h = torch.tanh(self.edge_proj(context))
+        beta = torch.sigmoid(self.beta_logit)
         H_g_batch = H_g.unsqueeze(0).expand(V.size(0), -1, -1)
-        H_local = torch.matmul(A, H_g_batch)
-        gate = torch.sigmoid(self.gate_scale * H_local)
-        alpha = torch.sigmoid(self.alpha_logit)
-        H_ref = H_g_batch * (1 + alpha * (gate - 0.5))
+        H_raw = H_g_batch + beta * delta_h
+        H_ref = torch.clamp(H_raw, min=0.0, max=1.0)
         G_ref = generate_G_from_H_batched(H_ref)
+
+        with torch.no_grad():
+            clamp_upper_ratio = (H_raw > 1.0).float().mean()
+            clamp_lower_ratio = (H_raw < 0.0).float().mean()
+            clamp_ratio = ((H_raw > 1.0) | (H_raw < 0.0)).float().mean()
+            h_ref_shift_ratio = (
+                torch.abs(H_ref - H_g_batch)
+                / torch.clamp(torch.abs(H_g_batch), min=self.monitor_eps)
+            ).mean()
+            sample_var = H_ref.var(dim=0, unbiased=False).mean()
+            self._last_monitor_stats = {
+                'beta': beta.detach().item(),
+                'delta_h_mean_abs': delta_h.detach().abs().mean().item(),
+                'clamp_upper_ratio': clamp_upper_ratio.detach().item(),
+                'clamp_lower_ratio': clamp_lower_ratio.detach().item(),
+                'clamp_ratio': clamp_ratio.detach().item(),
+                'h_ref_shift_ratio': h_ref_shift_ratio.detach().item(),
+                'sample_var': sample_var.detach().item(),
+            }
+
         return H_ref, G_ref
+
+    def get_monitor_stats(self):
+        return dict(self._last_monitor_stats)
 
 
 class HGNN(nn.Module):
@@ -264,11 +308,17 @@ class HGNN_Model(nn.Module):
         # self.stage_2_hgnn = HGNN(512,512,512)
         self.stage_3_hgnn = HGNN(1024, 1024, 1024)
         self.stage_4_hgnn = HGNN(2048, 2048, 2048)
-        self.stage_4_refiner = HypergraphTransformer(feature_dim=self.input_dim, attn_dim=self.input_dim)
         # self.learningMatrix = LearningMatrix()
         # H = np.load('/raid/ocr/lw/SSGRL-HGNN/data/coco/graph/conditional_prob_hyperG_top20_divide_80.npy')
         # self.label_embedding = torch.Tensor(cPickle.load(open('/raid/ocr/lw/ML-GCN/data/coco/coco_glove_word2vec.pkl', 'rb')))
-        self.H = nn.Parameter(self.load_features())  # torch.Tensor(generate_G_from_H(H))
+        H_init = self.load_features()
+        self.H = nn.Parameter(H_init)  # torch.Tensor(generate_G_from_H(H))
+        self.stage_4_refiner = HypergraphTransformer(
+            feature_dim=self.input_dim,
+            edge_dim=H_init.size(1),
+            attn_dim=512,
+        )
+        self._last_refinement_monitor_stats = {}
         # self.H = torch.eye(80).cuda()
 
     def load_features(self):
@@ -299,11 +349,15 @@ class HGNN_Model(nn.Module):
         # stage 4
         stage_4_batch_aog_nodes = input.view(batch_size, node_num, self.input_dim)
         _, G_ref = self.stage_4_refiner(stage_4_batch_aog_nodes, H_g)
+        self._last_refinement_monitor_stats = self.stage_4_refiner.get_monitor_stats()
         stage_4_batch_aog_nodes = self.stage_4_hgnn(stage_4_batch_aog_nodes, G_ref)
 
         batch_aog_nodes = torch.cat((stage_3_batch_aog_nodes, stage_4_batch_aog_nodes), 2)
 
         return batch_aog_nodes
+
+    def get_refinement_monitor_stats(self):
+        return dict(self._last_refinement_monitor_stats)
 
 
 class AdaHGNN(nn.Module):
@@ -345,6 +399,9 @@ class AdaHGNN(nn.Module):
         output = output.contiguous().view(batch_size, self.num_classes, self.output_dim)
         result = self.classifiers(output)
         return result
+
+    def get_refinement_monitor_stats(self):
+        return self.hgnn_model.get_refinement_monitor_stats()
 
     def load_features(self):
         return Parameter(torch.from_numpy(self.word_features.astype(np.float32)))
