@@ -23,6 +23,74 @@ from config import arg_parse, logger, show_args
 global bestPrec
 bestPrec = 0
 
+
+def get_refiner_monitor_stats(model):
+    monitor_model = model.module if hasattr(model, 'module') else model
+    if hasattr(monitor_model, 'get_refiner_monitor_stats'):
+        return monitor_model.get_refiner_monitor_stats()
+    return {}
+
+
+def update_epoch_monitor(epoch_monitor, stats, batch_size):
+    for key, value in stats.items():
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            value = value.detach().item()
+        value = float(value)
+        if not math.isfinite(value):
+            continue
+        epoch_monitor[key].update(value, batch_size)
+
+
+def log_refiner_monitor(logger, writer, optimizer, epoch, stats):
+    if not stats:
+        return
+
+    lr = optimizer.param_groups[0]['lr']
+    writer.add_scalar('Refiner/lr', lr, epoch)
+    for key, value in stats.items():
+        writer.add_scalar('Refiner/{}'.format(key), value, epoch)
+
+    logger.info(
+        '[Refiner] [Epoch {epoch}]: lr {lr:.6e}, alpha_logit {alpha_logit:.6f}, alpha {alpha:.6f}, alpha_logit_grad {alpha_logit_grad:.6e}\n'
+        '\tattn_scores mean {attn_scores_mean:.6f}, std {attn_scores_std:.6f}, abs_mean {attn_scores_abs_mean:.6f}, entropy {attn_entropy:.6f}\n'
+        '\tH_g mean {H_g_batch_mean:.6f}, std {H_g_batch_std:.6f} | H_ref mean {H_ref_mean:.6f}, std {H_ref_std:.6f} | delta abs_mean {H_ref_delta_abs_mean:.6f}, delta rms {H_ref_delta_rms:.6f}, delta rel_rms {H_ref_delta_rel_rms:.6f}\n'
+        '\tQ mean {Q_mean:.6f}, std {Q_std:.6f}, rms {Q_rms:.6f}, grad_rms {Q_grad_rms:.6e} | K mean {K_mean:.6f}, std {K_std:.6f}, rms {K_rms:.6f}, grad_rms {K_grad_rms:.6e}\n'
+        '\tq_proj_weight_rms {q_proj_weight_rms:.6f}, q_proj_weight_grad_rms {q_proj_weight_grad_rms:.6e} | k_proj_weight_rms {k_proj_weight_rms:.6f}, k_proj_weight_grad_rms {k_proj_weight_grad_rms:.6e} | global_H_rms {global_H_rms:.6f}, global_H_grad_rms {global_H_grad_rms:.6e}'.format(
+            epoch=epoch,
+            lr=lr,
+            alpha_logit=stats.get('alpha_logit', float('nan')),
+            alpha=stats.get('alpha', float('nan')),
+            alpha_logit_grad=stats.get('alpha_logit_grad', float('nan')),
+            attn_scores_mean=stats.get('attn_scores_mean', float('nan')),
+            attn_scores_std=stats.get('attn_scores_std', float('nan')),
+            attn_scores_abs_mean=stats.get('attn_scores_abs_mean', float('nan')),
+            attn_entropy=stats.get('attn_entropy', float('nan')),
+            H_g_batch_mean=stats.get('H_g_batch_mean', float('nan')),
+            H_g_batch_std=stats.get('H_g_batch_std', float('nan')),
+            H_ref_mean=stats.get('H_ref_mean', float('nan')),
+            H_ref_std=stats.get('H_ref_std', float('nan')),
+            H_ref_delta_abs_mean=stats.get('H_ref_delta_abs_mean', float('nan')),
+            H_ref_delta_rms=stats.get('H_ref_delta_rms', float('nan')),
+            H_ref_delta_rel_rms=stats.get('H_ref_delta_rel_rms', float('nan')),
+            Q_mean=stats.get('Q_mean', float('nan')),
+            Q_std=stats.get('Q_std', float('nan')),
+            Q_rms=stats.get('Q_rms', float('nan')),
+            Q_grad_rms=stats.get('Q_grad_rms', float('nan')),
+            K_mean=stats.get('K_mean', float('nan')),
+            K_std=stats.get('K_std', float('nan')),
+            K_rms=stats.get('K_rms', float('nan')),
+            K_grad_rms=stats.get('K_grad_rms', float('nan')),
+            q_proj_weight_rms=stats.get('q_proj_weight_rms', float('nan')),
+            q_proj_weight_grad_rms=stats.get('q_proj_weight_grad_rms', float('nan')),
+            k_proj_weight_rms=stats.get('k_proj_weight_rms', float('nan')),
+            k_proj_weight_grad_rms=stats.get('k_proj_weight_grad_rms', float('nan')),
+            global_H_rms=stats.get('global_H_rms', float('nan')),
+            global_H_grad_rms=stats.get('global_H_grad_rms', float('nan')),
+        )
+    )
+
 def main():
     global bestPrec
 
@@ -122,6 +190,7 @@ def main():
     scaler = amp.GradScaler(enabled=enable_amp)
     for epoch in range(args.start_epoch, args.start_epoch + args.epochs):
         train_loss, refinement_monitor_stats = Train(train_loader, model, criterion, optimizer, scaler, scheduler, writer, epoch, args)
+        log_refiner_monitor(logger, writer, optimizer, epoch, refinement_monitor_stats)
         mAP, top1_acc, top3_acc, top5_acc = Validate(test_loader, model, criterion, epoch, args, scheduler)
         scheduler.step(mAP)
 
@@ -188,6 +257,7 @@ def Train(train_loader, model, criterion, optimizer, scaler, scheduler, writer, 
         loss.update(loss_.item(), input.size(0))
         # Backward
         loss_.backward()
+        update_epoch_monitor(epoch_monitor, get_refiner_monitor_stats(model), input.size(0))
         optimizer.step()
         # scaler.scale(loss_).backward()
         # scaler.step(optimizer)
